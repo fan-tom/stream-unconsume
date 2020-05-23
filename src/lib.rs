@@ -22,9 +22,10 @@ pub struct StreamBuffer<S: Stream + Unpin> {
     // we need to extract these fields in destructor
     inner: ManuallyDrop<S>,
     buffer: ManuallyDrop<Vec<S::Item>>,
-    tx: ManuallyDrop<Sender<(S, Vec<S::Item>)>>,
+    tx: Option<Sender<(S, Vec<S::Item>)>>,
 }
 
+// S is Unpin, other fields are not pinned
 impl<S: Stream + Unpin> Unpin for StreamBuffer<S> {}
 
 impl<S: Stream + Unpin> StreamBuffer<S> {
@@ -32,7 +33,7 @@ impl<S: Stream + Unpin> StreamBuffer<S> {
         StreamBuffer {
             inner: ManuallyDrop::new(source),
             buffer: ManuallyDrop::new(Vec::new()),
-            tx: ManuallyDrop::new(tx),
+            tx: Some(tx),
         }
     }
 }
@@ -47,7 +48,7 @@ where
         let next = Pin::new(&mut *self.inner).poll_next(cx);
         match &next {
             Poll::Ready(Some(item)) => {
-                self.as_mut().buffer.push((*item).clone());
+                self.buffer.push((*item).clone());
                 next
             }
             _ => next,
@@ -55,11 +56,10 @@ where
     }
 }
 
+// SAFETY: StreamBuffer<S> is Unpin so we may use self: Self, forgetting the fact that self is ever pinned
 impl<S: Stream + Unpin> Drop for StreamBuffer<S> {
     fn drop(&mut self) {
-        // SAFETY: we don't use tx after this line, it is not touched by Drop too
-        // SAFETY: Sender<T> is Unpin for all T, so is S, so we can safely move them
-        let tx = unsafe { ManuallyDrop::take(&mut self.tx) };
+        let tx =  self.tx.take().expect("Sender is gone");
         // SAFETY: we don't use inner nor buffer after this line, it is not touched by Drop too
         // ignore error as we don't care if receiver no more interested in stream and buffer
         let _ = tx.send((
@@ -69,17 +69,17 @@ impl<S: Stream + Unpin> Drop for StreamBuffer<S> {
             // and Vec<S::Item> can be moved out of ManuallyDrop because we never pin it
             unsafe { ManuallyDrop::take(&mut self.buffer) },
         ));
-        // we don't call ManuallyDrop on fields as they are moved to channel, as well s channel itself
+        // we don't call ManuallyDrop on fields as they are moved to channel
     }
 }
 
 /// Returns stream that remembers all produced items
 /// And resolves returned future with stream that behaves like original stream was never polled
 /// In other words, it lets partially consume stream and get all consumed items back
-pub fn split<S: Stream + Unpin + 'static>(
+pub fn split<S: Stream + Unpin>(
     source: S,
 ) -> (
-    impl Future<Output = Result<impl Stream<Item = S::Item> + 'static, Canceled>>,
+    impl Future<Output = Result<impl Stream<Item = S::Item>, Canceled>>,
     impl Stream<Item = S::Item>,
 )
 where
