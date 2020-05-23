@@ -16,43 +16,34 @@ use futures::{
     stream::iter,
     Future, Stream, StreamExt,
 };
+use pin_project::{pin_project, pinned_drop};
 use std::mem::ManuallyDrop;
+use std::ops::DerefMut;
 use std::pin::Pin;
 
 // We require Unpin here to be able to move stream out of ManuallyDrop in Drop
+#[pin_project(PinnedDrop)]
 pub struct StreamBuffer<S: Stream + Unpin> {
     // we need to extract these fields in destructor
+    // pin stream as we need to poll it
+    #[pin]
     inner: ManuallyDrop<S>,
     buffer: ManuallyDrop<Vec<S::Item>>,
-    tx: ManuallyDrop<Sender<(S, Vec<S::Item>)>>,
+    tx: Option<Sender<(S, Vec<S::Item>)>>,
 }
 
 impl<S: Stream + Unpin> StreamBuffer<S> {
-    // unsafe_pinned!(inner: S);
-    fn inner(self: Pin<&mut Self>) -> Pin<&mut ManuallyDrop<S>> {
-        unsafe { Pin::map_unchecked_mut(self, |x| &mut x.inner) }
-    }
-
-    // like `inner()` but derefs further to underlying stream
+    // like `self.project().inner`, but derefs further to underlying stream
     fn stream(self: Pin<&mut Self>) -> Pin<&mut S> {
-        unsafe { Pin::map_unchecked_mut(self, |x| &mut *x.inner) }
-    }
-
-    // unsafe_unpinned!(buffer: ManuallyDrop<Vec<S::Item>>);
-    fn buffer(self: Pin<&mut Self>) -> &mut ManuallyDrop<Vec<S::Item>> {
-        unsafe { &mut Pin::get_unchecked_mut(self).buffer }
-    }
-
-    // unsafe_unpinned!(tx: ManuallyDrop<Sender<(S,Vec<S::Item>)>);
-    fn tx(self: Pin<&mut Self>) -> &mut ManuallyDrop<Sender<(S, Vec<S::Item>)>> {
-        unsafe { &mut Pin::get_unchecked_mut(self).tx }
+        // SAFETY: we just derefs further, moving S will be impossible, and we don't move anything in closure itself
+        unsafe { Pin::map_unchecked_mut(self, |x| x.inner.deref_mut()) }
     }
 
     fn new(source: S, tx: Sender<(S, Vec<S::Item>)>) -> Self {
         StreamBuffer {
             inner: ManuallyDrop::new(source),
             buffer: ManuallyDrop::new(Vec::new()),
-            tx: ManuallyDrop::new(tx),
+            tx: Some(tx),
         }
     }
 }
@@ -65,37 +56,29 @@ where
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let next = self.as_mut().stream().poll_next(cx);
-        match &next {
-            Poll::Ready(Some(item)) => {
-                self.as_mut().buffer().push((*item).clone());
-                next
-            }
-            _ => next,
+        if let Poll::Ready(Some(item)) = &next {
+            self.project().buffer.push((*item).clone());
         }
+        next
     }
 }
 
-impl<S: Stream + Unpin> Drop for StreamBuffer<S> {
-    fn drop(&mut self) {
-        // SAFETY: we wrap into pinned as we don't move self until it gets dropped
-        unsafe {
-            drop_pinned(Pin::new_unchecked(self));
-        }
-        fn drop_pinned<S: Stream + Unpin>(mut this: Pin<&mut StreamBuffer<S>>) {
-            // SAFETY: we don't use tx after this line, it is not touched by Drop too
-            // SAFETY: Sender<T> is Unpin for all T, so is S, so we can safely move them
-            let tx = unsafe { ManuallyDrop::take(this.as_mut().tx()) };
-            // SAFETY: we don't use inner nor buffer after this line, it is not touched by Drop too
-            // ignore error as we don't care if receiver no more interested in stream and buffer
-            let _ = tx.send((
-                // SAFETY: We required S to be Unpin, so here we can move it out of ManuallyDrop
-                unsafe { ManuallyDrop::take(Pin::into_inner(this.as_mut().inner())) },
-                // SAFETY: We don't need S::Item to be Unpin because we never pin them,
-                // and Vec<S::Item> can be moved out of ManuallyDrop because we never pin it
-                unsafe { ManuallyDrop::take(&mut this.as_mut().buffer()) },
-            ));
-            // we don't call ManuallyDrop on fields as they are moved to channel, as well s channel itself
-        }
+#[pinned_drop]
+impl<S: Stream + Unpin> PinnedDrop for StreamBuffer<S> {
+    fn drop(self: Pin<&mut Self>) {
+        let mut this = self.project();
+        // SAFETY: we take Sender<T> because we never pinned it and no one has references to/into it
+        let tx = this.tx.take().expect("Sender is gone");
+        // SAFETY: we don't use inner nor buffer after this line, they are not touched by Drop too
+        // ignore error as we don't care if receiver no more interested in stream and buffer
+        let _ = tx.send((
+            // SAFETY: We required S to be Unpin, so here we can move it out of ManuallyDrop
+            unsafe { ManuallyDrop::take(Pin::into_inner(this.inner)) },
+            // SAFETY: We don't need `S::Item`s to be Unpin because we never pin them,
+            // and Vec<S::Item> can be moved out of ManuallyDrop because we never pin it
+            unsafe { ManuallyDrop::take(&mut this.buffer) },
+        ));
+        // we don't call ManuallyDrop on fields as they are moved to channel
     }
 }
 
