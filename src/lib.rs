@@ -9,41 +9,30 @@
 //! Note: Rust doesn't guarantee that Drop is ever called, so you may need to use timeout when you await returned future,
 //! otherwise you will wait for it's resolve forever!
 
-use futures::channel::oneshot::Canceled;
-use futures::task::{Context, Poll};
 use futures::{
-    channel::oneshot::{self, Sender},
+    channel::oneshot::{self, Canceled, Sender},
     stream::iter,
+    task::{Context, Poll},
     Future, Stream, StreamExt,
 };
-use pin_project::{pin_project, pinned_drop};
-use std::mem::ManuallyDrop;
-use std::ops::DerefMut;
-use std::pin::Pin;
+use std::{mem::ManuallyDrop, pin::Pin};
 
 // We require Unpin here to be able to move stream out of ManuallyDrop in Drop
-#[pin_project(PinnedDrop)]
 pub struct StreamBuffer<S: Stream + Unpin> {
     // we need to extract these fields in destructor
-    // pin stream as we need to poll it
-    #[pin]
     inner: ManuallyDrop<S>,
     buffer: ManuallyDrop<Vec<S::Item>>,
-    tx: Option<Sender<(S, Vec<S::Item>)>>,
+    tx: ManuallyDrop<Sender<(S, Vec<S::Item>)>>,
 }
 
-impl<S: Stream + Unpin> StreamBuffer<S> {
-    // like `self.project().inner`, but derefs further to underlying stream
-    fn stream(self: Pin<&mut Self>) -> Pin<&mut S> {
-        // SAFETY: we just derefs further, moving S will be impossible, and we don't move anything in closure itself
-        unsafe { Pin::map_unchecked_mut(self, |x| x.inner.deref_mut()) }
-    }
+impl<S: Stream + Unpin> Unpin for StreamBuffer<S> {}
 
+impl<S: Stream + Unpin> StreamBuffer<S> {
     fn new(source: S, tx: Sender<(S, Vec<S::Item>)>) -> Self {
         StreamBuffer {
             inner: ManuallyDrop::new(source),
             buffer: ManuallyDrop::new(Vec::new()),
-            tx: Some(tx),
+            tx: ManuallyDrop::new(tx),
         }
     }
 }
@@ -55,30 +44,32 @@ where
     type Item = S::Item;
 
     fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        let next = self.as_mut().stream().poll_next(cx);
-        if let Poll::Ready(Some(item)) = &next {
-            self.project().buffer.push((*item).clone());
+        let next = Pin::new(&mut *self.inner).poll_next(cx);
+        match &next {
+            Poll::Ready(Some(item)) => {
+                self.as_mut().buffer.push((*item).clone());
+                next
+            }
+            _ => next,
         }
-        next
     }
 }
 
-#[pinned_drop]
-impl<S: Stream + Unpin> PinnedDrop for StreamBuffer<S> {
-    fn drop(self: Pin<&mut Self>) {
-        let mut this = self.project();
-        // SAFETY: we take Sender<T> because we never pinned it and no one has references to/into it
-        let tx = this.tx.take().expect("Sender is gone");
-        // SAFETY: we don't use inner nor buffer after this line, they are not touched by Drop too
+impl<S: Stream + Unpin> Drop for StreamBuffer<S> {
+    fn drop(&mut self) {
+        // SAFETY: we don't use tx after this line, it is not touched by Drop too
+        // SAFETY: Sender<T> is Unpin for all T, so is S, so we can safely move them
+        let tx = unsafe { ManuallyDrop::take(&mut self.tx) };
+        // SAFETY: we don't use inner nor buffer after this line, it is not touched by Drop too
         // ignore error as we don't care if receiver no more interested in stream and buffer
         let _ = tx.send((
             // SAFETY: We required S to be Unpin, so here we can move it out of ManuallyDrop
-            unsafe { ManuallyDrop::take(Pin::into_inner(this.inner)) },
-            // SAFETY: We don't need `S::Item`s to be Unpin because we never pin them,
+            unsafe { ManuallyDrop::take(&mut self.inner) },
+            // SAFETY: We don't need S::Item to be Unpin because we never pin them,
             // and Vec<S::Item> can be moved out of ManuallyDrop because we never pin it
-            unsafe { ManuallyDrop::take(&mut this.buffer) },
+            unsafe { ManuallyDrop::take(&mut self.buffer) },
         ));
-        // we don't call ManuallyDrop on fields as they are moved to channel
+        // we don't call ManuallyDrop on fields as they are moved to channel, as well s channel itself
     }
 }
 
@@ -106,10 +97,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::split;
-    use futures::channel::oneshot::Canceled;
-    use futures::executor::block_on;
-    use futures::future::ready;
-    use futures::StreamExt;
+    use futures::{channel::oneshot::Canceled, executor::block_on, future::ready, StreamExt};
 
     #[test]
     fn test_consumed_values_are_present() {
