@@ -16,29 +16,32 @@ use futures::{
     Future, Stream, StreamExt,
 };
 use std::{mem::ManuallyDrop, pin::Pin};
+use push_trait::PushBack;
 
 // We require Unpin here to be able to move stream out of ManuallyDrop in Drop
-pub struct StreamBuffer<S: Stream + Unpin> {
+pub struct StreamBuffer<B: PushBack<S::Item>, S: Stream + Unpin> {
     // we need to extract these fields in destructor
+    // we use Option only for channel as we need to take it only once,
+    // while stream and buffer are used every poll, so checking Options to be not empty on every unwrap is not cheap
     inner: ManuallyDrop<S>,
-    buffer: ManuallyDrop<Vec<S::Item>>,
-    tx: Option<Sender<(S, Vec<S::Item>)>>,
+    buffer: ManuallyDrop<B>,
+    tx: Option<Sender<(S, B)>>,
 }
 
 // S is Unpin, other fields are not pinned
-impl<S: Stream + Unpin> Unpin for StreamBuffer<S> {}
+impl<S: Stream + Unpin, B: PushBack<S::Item>> Unpin for StreamBuffer<B, S> {}
 
-impl<S: Stream + Unpin> StreamBuffer<S> {
-    fn new(source: S, tx: Sender<(S, Vec<S::Item>)>) -> Self {
+impl<S: Stream + Unpin, B: PushBack<S::Item> + Default> StreamBuffer<B, S> {
+    fn new(source: S, tx: Sender<(S, B)>) -> Self {
         StreamBuffer {
             inner: ManuallyDrop::new(source),
-            buffer: ManuallyDrop::new(Vec::new()),
+            buffer: ManuallyDrop::new(B::default()),
             tx: Some(tx),
         }
     }
 }
 
-impl<S: Stream + Unpin> Stream for StreamBuffer<S>
+impl<S: Stream + Unpin, B: PushBack<S::Item>> Stream for StreamBuffer<B, S>
 where
     S::Item: Clone,
 {
@@ -57,7 +60,7 @@ where
 }
 
 // SAFETY: StreamBuffer<S> is Unpin so we may use self: Self, forgetting the fact that self is ever pinned
-impl<S: Stream + Unpin> Drop for StreamBuffer<S> {
+impl<S: Stream + Unpin, B: PushBack<S::Item>> Drop for StreamBuffer<B, S> {
     fn drop(&mut self) {
         let tx =  self.tx.take().expect("Sender is gone");
         // SAFETY: we don't use inner nor buffer after this line, it is not touched by Drop too
@@ -76,7 +79,7 @@ impl<S: Stream + Unpin> Drop for StreamBuffer<S> {
 /// Returns stream that remembers all produced items
 /// And resolves returned future with stream that behaves like original stream was never polled
 /// In other words, it lets partially consume stream and get all consumed items back
-pub fn split<S: Stream + Unpin>(
+pub fn split<B: PushBack<S::Item> + IntoIterator<Item = S::Item> + Default, S: Stream + Unpin>(
     source: S,
 ) -> (
     impl Future<Output = Result<impl Stream<Item = S::Item>, Canceled>>,
@@ -91,7 +94,7 @@ where
         Ok(iter(buffer).chain(tail))
     };
     // fuse source stream to be able to poll it after finish (when we `chain` it with buffer)
-    (fut, StreamBuffer::new(source.fuse(), tx))
+    (fut, StreamBuffer::<B, _>::new(source.fuse(), tx))
 }
 
 #[cfg(test)]
@@ -103,8 +106,8 @@ mod tests {
     fn test_consumed_values_are_present() {
         let x = vec![1, 2, 3];
         let source = futures::stream::iter(x.clone().into_iter());
-        let (buffer, buffer_stream) = split(source);
-        block_on(async {
+        let (buffer, buffer_stream) = split::<Vec<_>, _>(source);
+        let res = block_on(async {
             // consume first two items
             buffer_stream.take(2).for_each(|_| ready(())).await;
             let stream = buffer.await?;
@@ -112,6 +115,7 @@ mod tests {
             assert_eq!(stream.collect::<Vec<_>>().await, x);
             Ok::<_, Canceled>(())
         });
+        assert!(res.is_ok());
     }
 
     #[test]
@@ -147,8 +151,8 @@ mod tests {
         let x = vec![1, 2, 3];
         // Here we want to emulate stream that panics on poll after finish
         let source = futures::stream::iter(UnfusedIter::new(x.clone().into_iter()));
-        let (buffer, buffer_stream) = split(source);
-        block_on(async {
+        let (buffer, buffer_stream) = split::<Vec<_>, _>(source);
+        let res = block_on(async {
             // consume whole stream
             buffer_stream.for_each(|_| ready(())).await;
             let stream = buffer.await?;
@@ -156,5 +160,6 @@ mod tests {
             assert_eq!(stream.collect::<Vec<_>>().await, x);
             Ok::<_, Canceled>(())
         });
+        assert!(res.is_ok());
     }
 }
