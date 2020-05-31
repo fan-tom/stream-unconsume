@@ -1,6 +1,6 @@
 [package]
 name = "stream-unconsume"
-version = "0.2.0"
+version = "0.3.0"
 authors = ["Alexey Gerasimov <lokomot476@gmail.com>"]
 description = "Partially consume stream and get it back unchanged"
 keywords = ["stream", "unconsume", "patial consume"]

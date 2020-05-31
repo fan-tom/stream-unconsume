@@ -1,13 +1,19 @@
 //! Poll stream partially and get emitted items back!
 
 //! Sometimes it is useful to let someone poll you stream but be able to get it back as if it was never polled.
-//! To do so, this crate provides function `split`, that, given stream, returns tuple of future and stream.
+//! To do so, this crate provides function `remember`, that, given stream, returns tuple of future and stream.
 //! You can move returned stream to any function, losing it, but, when it gets dropped,
-//! future, returned from `split`, is resolved with new stream that provides all items that was consumed from
+//! future, returned from `remember`, is resolved with new stream that provides all items that was consumed from
 //! original stream, as well as the rest of this stream, so you can use it as if you never poll original stream.
+//!
+//! You may specify any type to be used as buffer, as long as it implements `IntoIterator<Item=Source::Item>` and
+//! `PushBack<Source::Item>`, where `Source` is the type of stream you want to unconsume.
+//! There is convenience function `remember_vec`, to use `Vec` as buffer backend
 
 //! Note: Rust doesn't guarantee that Drop is ever called, so you may need to use timeout when you await returned future,
 //! otherwise you will wait for it's resolve forever!
+
+use std::{mem::ManuallyDrop, pin::Pin};
 
 use futures::{
     channel::oneshot::{self, Canceled, Sender},
@@ -15,7 +21,6 @@ use futures::{
     task::{Context, Poll},
     Future, Stream, StreamExt,
 };
-use std::{mem::ManuallyDrop, pin::Pin};
 use push_trait::PushBack;
 
 // We require Unpin here to be able to move stream out of ManuallyDrop in Drop
@@ -62,7 +67,7 @@ where
 // SAFETY: StreamBuffer<S> is Unpin so we may use self: Self, forgetting the fact that self is ever pinned
 impl<S: Stream + Unpin, B: PushBack<S::Item>> Drop for StreamBuffer<B, S> {
     fn drop(&mut self) {
-        let tx =  self.tx.take().expect("Sender is gone");
+        let tx = self.tx.take().expect("Sender is gone");
         // SAFETY: we don't use inner nor buffer after this line, it is not touched by Drop too
         // ignore error as we don't care if receiver no more interested in stream and buffer
         let _ = tx.send((
@@ -79,7 +84,7 @@ impl<S: Stream + Unpin, B: PushBack<S::Item>> Drop for StreamBuffer<B, S> {
 /// Returns stream that remembers all produced items
 /// And resolves returned future with stream that behaves like original stream was never polled
 /// In other words, it lets partially consume stream and get all consumed items back
-pub fn split<B: PushBack<S::Item> + IntoIterator<Item = S::Item> + Default, S: Stream + Unpin>(
+pub fn remember<B: PushBack<S::Item> + IntoIterator<Item = S::Item> + Default, S: Stream + Unpin>(
     source: S,
 ) -> (
     impl Future<Output = Result<impl Stream<Item = S::Item>, Canceled>>,
@@ -97,16 +102,29 @@ where
     (fut, StreamBuffer::<B, _>::new(source.fuse(), tx))
 }
 
+/// Convenience function to use `Vec` as buffer
+pub fn remember_vec<S: Stream + Unpin>(
+    source: S,
+) -> (
+    impl Future<Output = Result<impl Stream<Item = S::Item>, Canceled>>,
+    impl Stream<Item = S::Item>,
+)
+where
+    S::Item: Clone,
+{
+    remember::<Vec<_>, _>(source)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::split;
+    use super::{remember, remember_vec};
     use futures::{channel::oneshot::Canceled, executor::block_on, future::ready, StreamExt};
 
     #[test]
     fn test_consumed_values_are_present() {
         let x = vec![1, 2, 3];
         let source = futures::stream::iter(x.clone().into_iter());
-        let (buffer, buffer_stream) = split::<Vec<_>, _>(source);
+        let (buffer, buffer_stream) = remember::<Vec<_>, _>(source);
         let res = block_on(async {
             // consume first two items
             buffer_stream.take(2).for_each(|_| ready(())).await;
@@ -151,7 +169,7 @@ mod tests {
         let x = vec![1, 2, 3];
         // Here we want to emulate stream that panics on poll after finish
         let source = futures::stream::iter(UnfusedIter::new(x.clone().into_iter()));
-        let (buffer, buffer_stream) = split::<Vec<_>, _>(source);
+        let (buffer, buffer_stream) = remember_vec(source);
         let res = block_on(async {
             // consume whole stream
             buffer_stream.for_each(|_| ready(())).await;
